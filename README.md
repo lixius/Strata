@@ -1,5 +1,11 @@
 <h1 align="center">Strata</h1>
 
+> **Fork note — this is the [`mi50`](https://github.com/lixius/Strata/tree/mi50) branch of
+> [lixius/Strata](https://github.com/lixius/Strata), upstream [Niko1221/Strata](https://github.com/Niko1221/Strata)
+> v0.1.45.** It adds a reproducible MI50 / gfx906 (ROCm 7.14 container, ROCm 6.3.4 host) build, the gfx906
+> V_DOT2 attention kernel and `deploy/mi50/` scripts. Build, run and tuning steps: **[docs/MI50.md](docs/MI50.md)**.
+> `main` stays identical to upstream.
+
 **English** · [简体中文](README.zh-CN.md) · [日本語](README.ja.md) · [Deutsch](README.de.md) · [Français](README.fr.md) · [Español](README.es.md) · [Português](README.pt-BR.md)
 
 <p align="center"><b>Run a 125-billion-parameter AI model on your own gaming PC</b><br>
