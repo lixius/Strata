@@ -227,26 +227,63 @@ def fetch(out, only):
     os.makedirs(tdir, exist_ok=True)
     manifest = []
     chunk = 64 << 20
-    for r in rows:
-        if only and only not in r["name"]:
-            continue
+
+    def open_target(r):
+        """The tensor's file, resuming what is already there: (path, bytes already correct at the front)."""
         path = os.path.join(tdir, r["name"] + ".bin")
         want = SHA256.get(r["name"]) if pinned() else None
         if os.path.exists(path) and not same and (
                 want is None or os.path.getsize(path) != r["bytes"] or sha256_of(path) != want):
             os.remove(path)
+        have = os.path.getsize(path) if os.path.exists(path) else 0
+        if have > r["bytes"]:
+            os.remove(path)
+            have = 0
+        return path, have
+
+    todo = [r for r in rows if not (only and only not in r["name"])]
+    # The 31 MTP tensors live in 28 different shards, and the two expert tensors are 1.7 and 3.4 GB: one connection
+    # at a time is throttled hard by the CDN (measured ~0.3 MB/s here, ~2 MB/s with eight), so every 64 MB chunk of
+    # every tensor goes through one pool.  The sha256 check below is unchanged; STRATA_MTP_JOBS=1 is one at a time.
+    jobs = max(1, int(os.environ.get("STRATA_MTP_JOBS", "16")))
+    files, tasks = {}, []
+    for r in todo:
+        path, have = open_target(r)
+        files[r["name"]] = path
+        pos = r["start"] + have
+        while pos <= r["end"]:
+            end = min(pos + chunk - 1, r["end"])
+            tasks.append((r["shard"], path, pos - r["start"], pos, end))
+            pos = end + 1
+
+    import threading
+    lock, done = threading.Lock(), [0]
+
+    def one(task):
+        shard, path, off, pos, end = task
+        data = get(REPO + shard, pos, end)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o644)
+        try:
+            os.pwrite(fd, data, off)                # offset writes, so chunks of one tensor run at once
+        finally:
+            os.close(fd)
+        with lock:
+            done[0] += 1
+            print("chunk %d/%d" % (done[0], len(tasks)), file=sys.stderr)
+
+    if jobs == 1 or len(tasks) <= 1:
+        for t in tasks:
+            one(t)
+    else:
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as ex:
+            list(ex.map(one, tasks))
+
+    for r in todo:
+        path = files[r["name"]]
+        want = SHA256.get(r["name"]) if pinned() else None
+        digest = None
         for attempt in range(2):
-            have = os.path.getsize(path) if os.path.exists(path) else 0
-            if have > r["bytes"]:
-                os.remove(path)
-                have = 0
-            with open(path, "ab") as f:
-                pos = r["start"] + have
-                while pos <= r["end"]:
-                    end = min(pos + chunk - 1, r["end"])
-                    f.write(get(REPO + r["shard"], pos, end))
-                    pos = end + 1
-                    print("%s %.0f%%" % (r["name"], 100 * (pos - r["start"]) / r["bytes"]), file=sys.stderr)
             if os.path.getsize(path) != r["bytes"]:
                 sys.exit("%s: size %d != %d" % (path, os.path.getsize(path), r["bytes"]))
             digest = sha256_of(path)
@@ -257,6 +294,11 @@ def fetch(out, only):
                 sys.exit("%s: sha256 %s is not the checkpoint's %s - the download source sends wrong data (a mirror "
                          "that ignores Range requests?)" % (r["name"], digest, want))
             print("%s: wrong bytes (sha256 %s...), fetching it again" % (r["name"], digest[:12]), file=sys.stderr)
+            pos = r["start"]
+            while pos <= r["end"]:
+                end = min(pos + chunk - 1, r["end"])
+                one((r["shard"], path, pos - r["start"], pos, end))
+                pos = end + 1
         manifest.append(dict(r, file=os.path.relpath(path, out), sha256=digest))
     with open(os.path.join(out, "mtp-manifest.json"), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
