@@ -64,3 +64,11 @@ build-vision-cuda12.bat
 
 # local Windows HIP packaging output
 dist-hip/
+
+# Local MI50 (gfx906) work: benchmark output, the ROCm 7.14 venv and the run-*.json the launcher
+# writes. Generated, not source; docs/MI50.md builds a fresh checkout without any of them.
+/.venv-*/
+/arm-*.json
+/ctx-*.json
+/run-*.json
+/spec-*.json
