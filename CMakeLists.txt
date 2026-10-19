@@ -1579,7 +1579,7 @@ if(STRATA_NATIVE_EXPERTS)
     if(STRATA_HIP_GFX906)
       # gfx906: moe_fused_iq.cu's HIP half references f16kq's four entry points even though this backend never takes
       # the gfx11 F16 path (STRATA_PF_F16 is gfx11-only); its kernels are traps where STRATA_F16_DEVICE is 0.
-      target_sources(strata_mmq PRIVATE src/prefill/moe_f16_kq.cu)
+      target_sources(strata_mmq PRIVATE src/prefill/moe_f16_kq.cu src/prefill/iq_gemm_gfx906.cu)
     endif()
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1 q6_k, the experts of Unsloth's UD-Q4/Q5/Q6_K_XL (docs/QUANTS.md; the dispatch

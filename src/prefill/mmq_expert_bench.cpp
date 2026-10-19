@@ -17,11 +17,15 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <cstring>
 #include <random>
 #include <vector>
 
+#include "strata/prefill/iq_gemm_gfx906.hpp"
+
 namespace mmq = strata::prefill::mmq;
+namespace iqg = strata::prefill::iqgfx;
 
 namespace {
 
@@ -98,6 +102,42 @@ double run_case(const Case& c, int R, std::mt19937& rng, float* ms_out) {
     std::sort(ts.begin(), ts.end());
     const float ms = ts[ts.size() / 2];
     if (ms_out) *ms_out = ms;
+    // parity: the same products through Strata's own gfx906 kernel (unpack + int8 GEMM)
+    if (iqg::built() && iqg::supported(c.t)) {
+        signed char* du = nullptr; float* dsc = nullptr; void* xq = nullptr; float* dn = nullptr;
+        const size_t img = iqg::image_bytes(c.t, c.rows, c.cols);
+        ck(cudaMalloc(&du, (size_t) E * img), "u");
+        ck(cudaMalloc(&dsc, (size_t) E * iqg::scales_bytes(c.rows, c.cols)), "s");
+        ck(cudaMalloc(&xq, iqg::act_bytes(T, c.cols)), "xq");
+        ck(cudaMalloc(&dn, (size_t) T * c.rows * 4), "dst2");
+        for (int e = 0; e < E; ++e)
+            iqg::unpack_matrix(c.t, (const uint8_t*) dw + (size_t) e * per, c.rows, c.cols,
+                               du + (size_t) e * iqg::values_bytes(c.rows, c.cols),
+                               dsc + (size_t) e * iqg::scales_bytes(c.rows, c.cols) / 4, nullptr);
+        iqg::quantize_acts(dx, c.cols, T, c.cols, xq, nullptr);
+        iqg::gemm_group(c.t, du, dsc, xq, dn, c.rows, c.cols, R, E, nullptr);
+        if (cudaError_t e = cudaGetLastError(); e != cudaSuccess) std::printf("  iqg error: %s\n", cudaGetErrorString(e));
+        {   // dumps: what did the two passes actually write?
+            std::vector<signed char> hu(64); std::vector<unsigned char> hq(64); std::vector<float> hs(4);
+            ck(cudaMemcpy(hu.data(), du, hu.size(), cudaMemcpyDeviceToHost), "du");
+            ck(cudaMemcpy(hq.data(), xq, hq.size(), cudaMemcpyDeviceToHost), "xq");
+            ck(cudaMemcpy(hs.data(), dsc, 16, cudaMemcpyDeviceToHost), "dsc");
+            std::printf("  dump u=%d,%d,%d,%d  xq.ds=%02x%02x%02x%02x qs=%d,%d,%d  s=%.6f,%.6f\n",
+                        (int) hu[0], (int) hu[1], (int) hu[2], (int) hu[3], hq[0], hq[1], hq[2], hq[3], (int) (signed char) hq[4],
+                        (int) (signed char) hq[5], (int) (signed char) hq[6], (double) hs[0], (double) hs[1]);
+        }
+        std::vector<float> a((size_t) T * c.rows), bb((size_t) T * c.rows);
+        ck(cudaMemcpy(a.data(), dd, a.size() * 4, cudaMemcpyDeviceToHost), "a");
+        ck(cudaMemcpy(bb.data(), dn, bb.size() * 4, cudaMemcpyDeviceToHost), "b");
+        double maxd = 0, maxr = 0;
+        for (size_t i = 0; i < a.size(); ++i) {
+            maxd = std::max(maxd, (double) std::fabs(a[i] - bb[i]));
+            maxr = std::max(maxr, (double) std::fabs(a[i]));
+        }
+        std::printf("  parity %-14s R %4d: max|mmq-new| %.3e  max|mmq| %.3e  rel %.3e\n", c.name, R, maxd, maxr,
+                    maxr > 0 ? maxd / maxr : 0.0);
+        ck(cudaFree(du), "f"); ck(cudaFree(dsc), "f"); ck(cudaFree(xq), "f"); ck(cudaFree(dn), "f");
+    }
     cudaFree(dw); cudaFree(dx); cudaFree(dq); cudaFree(dys); cudaFree(dd); cudaFree(dids); cudaFree(db);
     cudaEventDestroy(e0); cudaEventDestroy(e1);
     return 2.0 * T * (double) c.rows * c.cols / (ms * 1e9);
@@ -112,17 +152,29 @@ int main(int argc, char** argv) {
     const char* mode = std::getenv("STRATA_PREFILL_NVFP4");
     std::printf("mmq_expert_bench: mode %s (FP4 activations: %s), 16 experts a launch, medians of 25\n",
                 mode ? mode : "w4a8", mmq::fp4_activations(GGML_TYPE_NVFP4) ? "yes" : "no");
+    // The Qwen3.8-Flash-Next IQ3_S pack's shapes (n_embd 2560, n_ff 640) and its mixed expert types:
+    // gate/up is one [2*n_ff, n_embd] product, down one [n_embd, n_ff].  Types the build does not cover are skipped.
     const Case cases[] = {{"nvfp4 gate/up", GGML_TYPE_NVFP4, 1280, 2560},
                           {"nvfp4 down", GGML_TYPE_NVFP4, 2560, 640},
                           {"q8_0 down", GGML_TYPE_Q8_0, 2560, 640},
                           {"iq3_s gate/up", GGML_TYPE_IQ3_S, 1280, 2560},
-                          {"iq4_nl down", GGML_TYPE_IQ4_NL, 2560, 640}};
+                          {"iq3_ss gate/up", GGML_TYPE_IQ3_XXS, 1280, 2560},
+                          {"iq2_s gate/up", GGML_TYPE_IQ2_S, 1280, 2560},
+                          {"iq4_xs gate/up", GGML_TYPE_IQ4_XS, 1280, 2560},
+                          {"iq3_s down", GGML_TYPE_IQ3_S, 2560, 640},
+                          {"iq4_nl down", GGML_TYPE_IQ4_NL, 2560, 640},
+                          {"q2_0 down", GGML_TYPE_Q2_0, 2560, 640}};
     std::mt19937 rng(7);
     for (int R : Rs)
         for (const Case& c : cases) {
+            if (!mmq::supported(c.t)) {
+                std::printf("  R %4d  %-14s (type %d not covered by this build)\n", R, c.name, (int) c.t);
+                continue;
+            }
             float ms = 0;
             const double tops = run_case(c, R, rng, &ms);
-            std::printf("  R %4d  %-14s %8.3f ms  %7.1f TOPS\n", R, c.name, ms, tops);
+            std::printf("  R %4d  %-14s %8.3f ms  %7.1f TOPS  (%5.1f %% of dot4 peak)\n", R, c.name, ms, tops,
+                        100.0 * tops / 53.0);
         }
     return 0;
 }
