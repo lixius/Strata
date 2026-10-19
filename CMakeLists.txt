@@ -1,4 +1,4 @@
-﻿# Strata Engine - top-level build (P1.S1).
+# Strata Engine - top-level build (P1.S1).
 #
 # Targets (phase-1 Ă‚Â§P1.S1): `strata_artifact` (no CUDA dependency), `tests`.  `strata_plan` and the C++
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
@@ -1122,6 +1122,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(hip_router_fast tests/hip/router_fast.cpp)
     target_include_directories(hip_router_fast PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(hip_router_fast PRIVATE strata_kernels ${_strata_gpu_runtime_target})
+    # Local (MI50): micro-benchmark + precision reference for the INT8 batched QSA attention.  This is the kernel the
+    # PROMPT path runs here (qsa_prompt_attn_batch refuses gfx906, so prefill.cpp falls back to it 32 queries at a
+    # time), so it is where the prompt attention's time goes and where a gfx906-specific kernel has to be measured.
+    add_executable(hip_attn_chunk_bench tests/hip/attn_chunk_bench.cpp)
+    target_include_directories(hip_attn_chunk_bench PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(hip_attn_chunk_bench PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
 
   add_executable(s_gemv_parity src/kernels/s_gemv_parity.cpp)
@@ -1570,6 +1576,11 @@ if(STRATA_NATIVE_EXPERTS)
     add_library(strata_mmq STATIC src/prefill/moe_mmq.cu src/prefill/moe_fused.cu src/prefill/moe_fused_iq.cu
                 src/prefill/mmq_nvfp4_w4a8.cu
                 src/prefill/ggml_cuda_host.cu ${_strata_mmq}/quantize.cu)
+    if(STRATA_HIP_GFX906)
+      # gfx906: moe_fused_iq.cu's HIP half references f16kq's four entry points even though this backend never takes
+      # the gfx11 F16 path (STRATA_PF_F16 is gfx11-only); its kernels are traps where STRATA_F16_DEVICE is 0.
+      target_sources(strata_mmq PRIVATE src/prefill/moe_f16_kq.cu)
+    endif()
     # q8_0: the drafter's matrices (E-9); STRATA_ORCA_Q4KS_MMQ adds q5_0 (#296, in _strata_mmq_types), and
     # STRATA_MMQ_KQUANTS q4_k q5_k q5_1 q6_k, the experts of Unsloth's UD-Q4/Q5/Q6_K_XL (docs/QUANTS.md; the dispatch
     # follows eddoursul/Strata 7706c1b).  MODEL-UPDATE Phase 1: on CUDA they are a library of their own, strata_kq
@@ -1590,19 +1601,23 @@ if(STRATA_NATIVE_EXPERTS)
     # NVFP4: W4A8 (default) in mmq_nvfp4_w4a8.cu with the plain architectures; the opt-in W4A4 needs RTX 50's FP4 MMA,
     # which exists only in the arch-specific target, so its one unit alone is built with 12x -> 12xa (the default
     # binary is unchanged and runs on sm_121; a card without that image falls back to W4A8 at run time)
-    set(_strata_w4a4_archs ${CMAKE_CUDA_ARCHITECTURES})
-    # (two steps: CMake before 3.29 rejects a \2 whose optional group did not match, "120" alone)
-    list(TRANSFORM _strata_w4a4_archs REPLACE "^(12[0-9])$" "\\1a")
-    list(TRANSFORM _strata_w4a4_archs REPLACE "^(12[0-9])-(real|virtual)$" "\\1a-\\2")
-    add_library(strata_mmq_w4a4 STATIC src/prefill/mmq_nvfp4_w4a4.cu)
-    set_target_properties(strata_mmq_w4a4 PROPERTIES CUDA_ARCHITECTURES "${_strata_w4a4_archs}")
-    target_include_directories(strata_mmq_w4a4 PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq})
-    target_compile_options(strata_mmq_w4a4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
-    if(MSVC)
-      target_compile_options(strata_mmq_w4a4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
+    # gfx906: no FP4 MMA, and moe_mmq.cu compiles the HIP branch that never references the W4A4 unit; the unit also
+    # includes ggml-cuda's common.cuh without GGML_USE_HIP (strata_mmq gets that definition, this target does not).
+    if(NOT STRATA_HIP_GFX906)
+      set(_strata_w4a4_archs ${CMAKE_CUDA_ARCHITECTURES})
+      # (two steps: CMake before 3.29 rejects a \2 whose optional group did not match, "120" alone)
+      list(TRANSFORM _strata_w4a4_archs REPLACE "^(12[0-9])$" "\\1a")
+      list(TRANSFORM _strata_w4a4_archs REPLACE "^(12[0-9])-(real|virtual)$" "\\1a-\\2")
+      add_library(strata_mmq_w4a4 STATIC src/prefill/mmq_nvfp4_w4a4.cu)
+      set_target_properties(strata_mmq_w4a4 PROPERTIES CUDA_ARCHITECTURES "${_strata_w4a4_archs}")
+      target_include_directories(strata_mmq_w4a4 PRIVATE ${_strata_gg}/include ${_strata_gg}/src ${_strata_mmq})
+      target_compile_options(strata_mmq_w4a4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda -use_fast_math>)
+      if(MSVC)
+        target_compile_options(strata_mmq_w4a4 PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/bigobj>)
+      endif()
+      target_link_libraries(strata_mmq_w4a4 PUBLIC ggml-base ${_strata_gpu_runtime_target})
+      target_link_libraries(strata_mmq PRIVATE strata_mmq_w4a4)
     endif()
-    target_link_libraries(strata_mmq_w4a4 PUBLIC ggml-base ${_strata_gpu_runtime_target})
-    target_link_libraries(strata_mmq PRIVATE strata_mmq_w4a4)
     # STRATA_MMQ_TAB: the pointer-table copy of MMQ's scheduler mirrors mmq.cuh from mul_mat_q_process_tile through
     # mul_mat_q_case (struct mmq_args included).  A fingerprint of that text instead of a compile probe: nothing is
     # compiled at configure time, and a llama.cpp tree with another scheduler turns the feature off instead of

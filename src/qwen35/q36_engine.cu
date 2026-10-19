@@ -279,7 +279,7 @@ __global__ void k_attn_prep(const float* qg, const float* kx, const float* vx, c
     const int half = n_rot / 2;
     if (i < n_rot) {
         const int p = i < half ? i : i - half;
-        const int rp = mtab ? __ldg(mtab + (size_t) pos * 3 + p % 3) : pos + dl;
+        const int rp = mtab ? mtab[(size_t) pos * 3 + p % 3] : pos + dl;   // plain load: ROCm 6.3.4's __ldg has no int overload
         const float theta = (float) rp * powf(base, -2.0f * (float) p / (float) n_rot);
         float sn, cs;
         sincosf(theta, &sn, &cs);
@@ -1654,9 +1654,12 @@ struct Engine {
                     unsigned ds_a, ds_b;
                     std::memcpy(&ds_a, &a[o], 4);
                     std::memcpy(&ds_b, &b[o], 4);
+                    const __half h0 = __float2half(t[0]);
+                    unsigned short h0b;
+                    std::memcpy(&h0b, &h0, sizeof h0b);   // __half_as_ushort is device-only in ROCm 6.3.4
                     std::fprintf(stderr, "VDEBUG block %zu: ds new %08x old %08x, qs bytes %s, cpu butterfly sum %.9g (half %04x)\n",
                                  blk, ds_a, ds_b, std::memcmp(&a[o + 4], &b[o + 4], 32) == 0 ? "equal" : "DIFFER", (double) t[0],
-                                 (unsigned) __half_as_ushort(__float2half(t[0])));
+                                 (unsigned) h0b);
                     break;
                 }
         }

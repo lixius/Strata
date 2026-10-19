@@ -326,6 +326,166 @@ __global__ void __launch_bounds__(THREADS) attn_chunk_rows_kernel(const float* _
                                                   part_acc, part_m, part_l, n_chunks, cap, scratch_stride);
 }
 
+#if defined(STRATA_HIP_GFX906)
+// ======================= gfx906: the INT8-KV chunk attention on V_DOT2_F32_F16 =======================
+// Opt-in STRATA_GFX906_ATTN_DOT2=1.  gfx906 has no matrix cores, so `attn_chunk_kernel` does every product with FP32
+// SIMT arithmetic.  It does have V_DOT2_F32_F16 (`d.f32 = a.lo*b.lo + a.hi*b.hi + c.f32`), and this kernel uses it for
+// both phases.  Ablating the FP32 kernel on an MI50 (tests/hip/attn_chunk_bench.cpp, ctx 8192 / 2048 queries, INT8
+// pools) says where its 37.3 ms goes: the score phase 43%, the value phase 39%, and the QUERY'S SHARED-MEMORY READS
+// alone 41% - it is not FMA-bound, it is bound by the shared-memory traffic of reading 12 heads x 32 bytes of FP32
+// query per lane per cell.  Halving that traffic (fp16 query) and the instruction count is what this kernel is for.
+//
+//   * SCORES.  The query is stored in shared memory as fp16 in natural order, one 16-byte read per (head, cell)
+//     (ds_read_b128: 8 lanes cover all 32 banks, so unlike the FP32 kernel this layout needs no swizzle).  The int8
+//     key codes are converted to half2 once per cell and four V_DOT2_F32_F16 replace eight FMA.  The KV scale is
+//     applied once per head, after the dot, exactly as the FP32 kernel applies it inside `load8`.
+//   * VALUES.  V_DOT2_F32_F16's accumulator is FP32 (dst and src2 are .f32), so the two halves of one instruction
+//     must feed the SAME output: two adjacent CELLS are paired, `p[h][c]*v[c] + p[h][c+1]*v[c+1]`, which is the two
+//     terms the FP32 kernel adds one at a time.  The probabilities are stored fp16, so a head's two cells are one
+//     32-bit shared read; the two values are packed into one half2.  Twelve FMA and twelve shared reads per cell
+//     become six dot2 and six shared reads per TWO cells.
+//
+// Numerics.  The query is rounded to fp16 (2^-11 relative), which is finer than the int8 KV storage it is dotted
+// against, so the scores stay of the same order of accuracy as the storage.  The probabilities are rounded to fp16
+// after a 2^8 pre-scale, which keeps the whole useful range normal (not subnormal) in fp16; the accumulator itself
+// stays FP32 and is scaled back at the store.  Softmax, the chunk max/sum, the merge and the mask semantics are the
+// FP32 kernel's, unchanged.
+__device__ __forceinline__ float strata_dot2_f32_f16(uint32_t a, uint32_t b, float acc) {
+    asm("v_dot2_f32_f16 %0, %1, %2, %0" : "+v"(acc) : "v"(a), "v"(b));
+    return acc;
+}
+
+__global__ void __launch_bounds__(THREADS) attn_chunk_kernel_gfx906(
+    const float* __restrict__ q, QsaAttnPools p, const int32_t* __restrict__ ids, const int32_t* __restrict__ step,
+    int n_kv_heads, int page_size, float scale, float* __restrict__ part_acc, float* __restrict__ part_m,
+    float* __restrict__ part_l, int n_chunks, int cap = 0, long long scratch_stride = 0) {
+    constexpr int NG = HD / KV_Q8_GROUP;          // 4 scale groups per head
+    constexpr float kProbScale = 256.0f;          // keeps the probabilities normal in fp16 (see the header)
+
+    q += (size_t) blockIdx.z * (size_t) (n_kv_heads * G) * HD;
+    ids += (size_t) blockIdx.z * (size_t) cap;
+    step += (size_t) blockIdx.z * kStepCount;
+    part_acc += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_m += (size_t) blockIdx.z * (size_t) scratch_stride;
+    part_l += (size_t) blockIdx.z * (size_t) scratch_stride;
+
+    __shared__ __align__(16) __half sqh[G][HD];    // 6 KB: the fp16 query image (12 KB of fp32 -> half the reads)
+    __shared__ float sp[G][CHUNK];                 // 3 KB: scores, then the FP32 probabilities (softmax + odd tail)
+    __shared__ __half sph[G][CHUNK];               // 1.5 KB: the same probabilities in fp16, two cells per dot2
+    __shared__ long long srow[CHUNK];              // 512 B
+    const int n_ids = __ldg(step + kStepWidth);
+    const int chunk = blockIdx.x, kvh = blockIdx.y;
+    const int t = threadIdx.x, lane = t & 31, warp = t >> 5;
+    const int c0 = chunk * CHUNK;
+    const int n_here = min(CHUNK, n_ids - c0);
+    const int slot = kvh * n_chunks + chunk;
+    if (n_here <= 0) {
+        if (t < G) { part_m[slot * G + t] = -FLT_MAX; part_l[slot * G + t] = 0.0f; }
+        return;
+    }
+    for (int i = t; i < G * HD; i += THREADS)
+        sqh[i / HD][i % HD] = __float2half_rn(q[(size_t) (kvh * G) * HD + i]);
+    if (t < CHUNK) {
+        long long r = -1;
+        if (t < n_here) {
+            const int cell = ids[c0 + t];
+            const long long page = (long long) p.page_table[cell / page_size];
+            if (page >= 0) r = (page * n_kv_heads + kvh) * page_size + (cell % page_size);
+        }
+        srow[t] = r;
+    }
+    __syncthreads();
+    // ---- scores: four V_DOT2_F32_F16 per (head, cell) ---------------------------------------------------------
+    for (int c = warp; c < CHUNK; c += WARPS) {
+        if (c >= n_here || srow[c] < 0) {
+            if (lane < G) sp[lane][c] = -FLT_MAX;
+            continue;
+        }
+        const long long row = srow[c];
+        const uint2 kraw = *reinterpret_cast<const uint2*>(p.k_q + row * HD + lane * 8);
+        const int8_t* kb = reinterpret_cast<const int8_t*>(&kraw);
+        const __half2 kh[4] = {__floats2half2_rn((float) kb[0], (float) kb[1]),
+                               __floats2half2_rn((float) kb[2], (float) kb[3]),
+                               __floats2half2_rn((float) kb[4], (float) kb[5]),
+                               __floats2half2_rn((float) kb[6], (float) kb[7])};
+        const uint32_t k0 = *reinterpret_cast<const uint32_t*>(&kh[0]);
+        const uint32_t k1 = *reinterpret_cast<const uint32_t*>(&kh[1]);
+        const uint32_t k2 = *reinterpret_cast<const uint32_t*>(&kh[2]);
+        const uint32_t k3 = *reinterpret_cast<const uint32_t*>(&kh[3]);
+        const float ksc = __half2float(__ushort_as_half(p.k_scale[row * NG + lane / 8]));
+        float part[16];
+#pragma unroll
+        for (int h = 0; h < G; ++h) {
+            const uint4 qraw = *reinterpret_cast<const uint4*>(&sqh[h][lane * 8]);
+            float s = strata_dot2_f32_f16(qraw.x, k0, 0.0f);
+            s = strata_dot2_f32_f16(qraw.y, k1, s);
+            s = strata_dot2_f32_f16(qraw.z, k2, s);
+            s = strata_dot2_f32_f16(qraw.w, k3, s);
+            part[h] = s * ksc;
+        }
+#pragma unroll
+        for (int h = G; h < 16; ++h) part[h] = 0.0f;
+        const float score = reduce12_gfx906(part, lane);
+        const int head = reduce12_head_of_lane(lane);
+        if ((lane & 1) == 0 && head < G) sp[head][c] = score * scale;
+    }
+    __syncthreads();
+    // ---- chunk max and exp-sum, and the fp16 probability image the values phase reads -------------------------
+    for (int h = warp; h < G; h += WARPS) {
+        const float a = sp[h][lane], b = sp[h][lane + 32];
+        const float m = warp_max(fmaxf(a, b));
+        const float ea = (lane < n_here && srow[lane] >= 0) ? __expf(a - m) : 0.0f;
+        const float eb = (lane + 32 < n_here && srow[lane + 32] >= 0) ? __expf(b - m) : 0.0f;
+        sp[h][lane] = ea;
+        sp[h][lane + 32] = eb;
+        sph[h][lane] = __float2half_rn(ea * kProbScale);
+        sph[h][lane + 32] = __float2half_rn(eb * kProbScale);
+        const float l = warp_sum(ea + eb);
+        if (lane == 0) { part_m[slot * G + h] = m; part_l[slot * G + h] = l; }
+    }
+    __syncthreads();
+    // ---- values: six V_DOT2_F32_F16 per TWO cells (thread t owns dimension t for all 12 heads) ----------------
+    float acc[G];
+#pragma unroll
+    for (int h = 0; h < G; ++h) acc[h] = 0.0f;
+    const int n_pair = n_here & ~1;
+    for (int c = 0; c < n_pair; c += 2) {
+        const long long r0 = srow[c], r1 = srow[c + 1];
+        float v0 = 0.0f, v1 = 0.0f;   // a masked cell (page -1) contributes 0, as its weight 0 does above
+        if (r0 >= 0)
+            v0 = (float) p.v_q[r0 * HD + t] * __half2float(__ushort_as_half(p.v_scale[r0 * NG + t / KV_Q8_GROUP]));
+        if (r1 >= 0)
+            v1 = (float) p.v_q[r1 * HD + t] * __half2float(__ushort_as_half(p.v_scale[r1 * NG + t / KV_Q8_GROUP]));
+        const __half2 vv = __floats2half2_rn(v0, v1);
+        const uint32_t vb = *reinterpret_cast<const uint32_t*>(&vv);
+#pragma unroll
+        for (int h = 0; h < G; ++h)
+            acc[h] = strata_dot2_f32_f16(*reinterpret_cast<const uint32_t*>(&sph[h][c]), vb, acc[h]);
+    }
+    if (n_here & 1) {   // the odd tail cell keeps the FP32 path (its probability is already in `sp`)
+        const int c = n_here - 1;
+        if (srow[c] >= 0) {
+            const long long r = srow[c];
+            const float v =
+                (float) p.v_q[r * HD + t] * __half2float(__ushort_as_half(p.v_scale[r * NG + t / KV_Q8_GROUP]));
+#pragma unroll
+            for (int h = 0; h < G; ++h) acc[h] = fmaf(sp[h][c] * kProbScale, v, acc[h]);
+        }
+    }
+    const float inv = 1.0f / kProbScale;
+#pragma unroll
+    for (int h = 0; h < G; ++h) part_acc[((size_t) slot * G + h) * HD + t] = acc[h] * inv;
+}
+
+bool gfx906_dot2_attn() {
+    static const bool on = [] {
+        const char* v = std::getenv("STRATA_GFX906_ATTN_DOT2");
+        return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    return on;
+}
+#endif  // STRATA_HIP_GFX906
+
 #if !defined(__HIPCC__)
 // Turing (INT8 pools): attn_chunk_kernel<1> bit for bit, rearranged for the SM's shared-memory pipe, which the
 // default kernel saturates (its time grew with the queries even with the SMs half empty).  Three changes, none to an
@@ -971,6 +1131,20 @@ void launch_chunks_batch(const float* q, const QsaAttnPools& pools, const int32_
         else STRATA_ATTN_LC(0);
     } else
 #undef STRATA_ATTN_LC
+#if defined(STRATA_HIP_GFX906)
+    // STRATA_GFX906_ATTN_DOT2=1: the V_DOT2_F32_F16 kernel above (INT8 pools only; independent of the swizzle switch).
+    if (kernel < 0 && kv_mode == 1 && gfx906_dot2_attn() && query_swizzle_gfx906_device()) {
+        attn_chunk_kernel_gfx906<<<grid, THREADS, 0, st>>>(q, pools, ids, steps, (int) s.n_head_kv,
+            (int) s.page_size, scale, part_acc, part_m, part_l, n_chunks, (int) cap, stride);
+        static const bool dot2_trace = std::getenv("STRATA_GFX906_ATTN_DOT2_TRACE") != nullptr;
+        static thread_local bool dot2_said = false;
+        if (dot2_trace && !dot2_said) {
+            dot2_said = true;
+            std::fprintf(stderr, "strata attn-dot2: selected=1 kv_mode=1 nq=%lld cap=%lld n_chunks=%d\n",
+                         (long long) n_q, (long long) cap, n_chunks);
+        }
+    } else
+#endif
 #if defined(STRATA_HIP_GFX906)
     // Opt-in INT8 batched attention: prefill, verification and MTP (including n_q=1).
     // Other pool formats and lane-cell scoring keep their paths; qsa_decode_attn_step is unchanged.
